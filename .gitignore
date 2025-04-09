@@ -1,0 +1,11 @@
+# Ignore .env file
+.env
+
+# Ignore virtual environment folder
+ata_env/
+
+# Ignore trained models
+models/
+
+# Ignore data files
+data/
