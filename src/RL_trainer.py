@@ -1,5 +1,6 @@
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.vec_env import VecNormalize
 from custom_trading_env import CustomTradingEnv
 import pandas as pd
@@ -85,11 +86,28 @@ df['rsi'] = compute_rsi(df['close'])  # Implement compute_rsi function
 df.loc[:, 'rsi'] = df['rsi'].fillna(50)  # Fill NaN RSI values with 50
 df.dropna(inplace=True)  # Drop rows with any remaining NaN values
 
+env_count = 4  # Number of environments to run in parallel
+
 # Initialize the environment
 env = CustomTradingEnv(df=df)
 
-# Wrap the environment for vectorized training
+# # Wrap the environment for vectorized training
 vec_env = make_vec_env(lambda: env, n_envs=1)
+
+"""
+4 Environments in parallel
+"""
+# # Define a function to create a new instance of the environment
+# def make_env(env_id, df):
+#     def _init():
+#         return CustomTradingEnv(df=df)
+#     return _init
+# # Create a list of environment creation functions
+# env_count = 4  # Number of environments to run in parallel
+# env_fns = [make_env(i, df) for i in range(env_count)]
+# # Use SubprocVecEnv for parallel environments
+# vec_env = SubprocVecEnv(env_fns)
+
 
 # Normalize observations and rewards
 vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True)
@@ -105,7 +123,7 @@ tensorboard_log_dir = "tensorboard_logs/"
 #     learning_rate=1e-4,  # Decreased learning rate
 #     ent_coef=0.4,  # Encourage exploration
 #     gamma=0.99,  # Discount factor
-#     n_steps=4096,  # Smaller batch of steps
+#     n_steps=4096 // env_count,  # Smaller batch of steps
 #     batch_size=128,  # Batch size for updates
 #     clip_range=0.2,  # Increased clipping range
 #     tensorboard_log=tensorboard_log_dir  # Enable TensorBoard logging
@@ -123,7 +141,8 @@ model = SAC(
     learning_starts=1000,      # Steps before training begins
     batch_size=128,            # Mini-batch size
     tau=0.02,                  # Soft update coefficient
-    tensorboard_log=tensorboard_log_dir
+    tensorboard_log=tensorboard_log_dir,
+    device='cuda',            # Use GPU if available 
 )
 
 # Train the model

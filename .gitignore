@@ -12,3 +12,6 @@ tensorboard_logs/
 
 # Ignore data files
 data/
+
+# Ignore certs
+certs/
