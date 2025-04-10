@@ -35,6 +35,9 @@ def fetch_and_store_data(symbols, start_date, end_date, timeframe="1Minute", out
         timeframe (str): Timeframe for the data (e.g., "1Minute", "1Hour").
         output_format (str): Output format ("csv" or "sqlite").
     """
+    # Adjust the end date to exclude the test period
+    adjusted_end_date = end_date - timedelta(days=7)  # Exclude the last week for api (for some reason)
+
     project_directory = os.path.dirname(os.path.dirname(__file__))  # Get PROJECTDIRECTORY
     data_directory = os.path.join(project_directory, "data")  # Define "PROJECTDIRECTORY/data"
 
@@ -45,22 +48,22 @@ def fetch_and_store_data(symbols, start_date, end_date, timeframe="1Minute", out
         current_start_date = start_date
         all_data = pd.DataFrame()
 
-        while current_start_date < end_date:
+        while current_start_date < adjusted_end_date:
             # Determine the current end date for the fetch
             current_end_date = current_start_date + timedelta(days=7)  # Fetch 7 days at a time
-            if current_end_date > end_date:
-                current_end_date = None  # Leave end_date empty for the last fetch
+            if current_end_date > adjusted_end_date:
+                current_end_date = adjusted_end_date  # Limit to the adjusted end date
 
-            print(f"Fetching data from {current_start_date} to {current_end_date or 'latest'}...")
+            print(f"Fetching data from {current_start_date} to {current_end_date}...")
             data = data_handler.fetch_historical_data(
                 symbol=symbol,
                 start_date=current_start_date,
-                end_date=current_end_date,  # Pass None for the last fetch
+                end_date=current_end_date,
                 timeframe=timeframe
             )
 
             if data.empty:
-                print(f"No data found for {symbol} from {current_start_date} to {current_end_date or 'latest'}.")
+                print(f"No data found for {symbol} from {current_start_date} to {current_end_date}.")
                 break
 
             # Append the fetched data to the main DataFrame
@@ -70,15 +73,14 @@ def fetch_and_store_data(symbols, start_date, end_date, timeframe="1Minute", out
             current_start_date = pd.to_datetime(data['timestamp'].iloc[-1]) + timedelta(minutes=1)
 
         # Save the combined data to a CSV file
-        output_file = os.path.join(data_directory, f"test_{symbol}.csv") # "{symbol}.csv"
+        output_file = os.path.join(data_directory, f"{symbol}.csv")
         all_data.to_csv(output_file, index=False)
         print(f"Data for {symbol} saved to {output_file}.")
-
 
 if __name__ == "__main__":
     # Define the symbols and date range
     symbols = ["AAPL"]  # Add the stocks/ETFs you plan to trade
-    start_date = datetime.now(ZoneInfo("America/Los_Angeles")) - timedelta(days=14)  # Last 6 months  Last two weeks for testing models
+    start_date = datetime.now(ZoneInfo("America/Los_Angeles")) - timedelta(days=548)  # Last 18 months  Last two weeks for testing models
     end_date = datetime.now(ZoneInfo("America/Los_Angeles"))
     timeframe = "1Minute"  # Minute-level data
     output_format = "csv"
