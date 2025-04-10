@@ -166,6 +166,13 @@ class CustomTradingEnv(gym.Env):
         drawdown = (max_portfolio_value - self.total_value) / max_portfolio_value if max_portfolio_value > 0 else 0
         drawdown_penalty = 0
 
+        # Include sentiment score
+        sentiment_score = 0
+        # Calculate sentiment score
+        if 'sentiment' in self.df.columns:
+            sentiment_score = self.df.loc[self.current_step, 'sentiment']
+        else:
+            sentiment_score = 0
 
         if self.term_train:
             # Check if the agent chooses to terminate the episode
@@ -192,9 +199,10 @@ class CustomTradingEnv(gym.Env):
         #     )
 
         reward = (
-            0.5 * step_return +
-            0.5 * sharpe_ratio +
-            0.2 * drawdown_penalty 
+            0.6 * step_return +
+            0.3 * sharpe_ratio +
+            0.1 * sentiment_score
+            # 0.2 * drawdown_penalty 
         )
 
         if self.term_train:

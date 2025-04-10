@@ -69,7 +69,7 @@ def compute_rsi(close_prices, window=14):
 
 # Load historical data
 symbol = "AAPL"
-df = pd.read_csv(f"data/{symbol}.csv")
+df = pd.read_csv(f"data/{symbol}_with_sentiment.csv")
 
 # Preprocess the data
 df['timestamp'] = pd.to_datetime(df['timestamp'])  # Convert timestamp to datetime
