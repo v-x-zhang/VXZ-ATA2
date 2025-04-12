@@ -21,7 +21,7 @@ class CustomTradingEnv(gym.Env):
     metadata = {'render_modes': ['human']}
     render_mode = 'human'
 
-    def __init__(self, df, initial_balance=100000, lookback_window=30, transaction_cost=0.002, transition_steps=8000, max_episode_length=8000, term_train=True):
+    def __init__(self, df, initial_balance=100000, lookback_window=30, transaction_cost=0.002, transition_steps=8000, max_episode_length=4000, term_train=True):
         """
         Initialize the environment.
 
@@ -40,12 +40,25 @@ class CustomTradingEnv(gym.Env):
         self.total_steps = 0  # Track total steps taken
         self.initial_balance = initial_balance
         self.lookback_window = lookback_window
-        # self.max_episode_length = max_episode_length  # Maximum episode length
+        self.max_episode_length = max_episode_length  # Maximum episode length
+        self.episode_return = 0  # Track cumulative return for the episode
         # OR
-        self.max_episode_length = random.randint(2000, 8000)  # Randomize episode length
+        # self.max_episode_length = random.randint(2000, 8000)  # Randomize episode length
+
+        self.returns = []  # Track returns for Sharpe Ratio calculation
 
         self.current_episode_steps = 0  # Track steps within the current episode
         self.transaction_cost = transaction_cost
+
+        self.low_holdings_counter = 0  # Counter for consecutive low holdings
+        self.low_holdings_threshold = 0.05  # Threshold for low holdings (e.g., 1% of initial balance)
+
+        self.total_realized_profit = 0  # Track total realized profit
+
+        # Initialize cost basis tracking
+        self.cost_basis_per_share = 0
+        self.total_shares_bought = 0
+        self.total_cost = 0
 
         # Ensure dataset is large enough
         assert len(self.df) > self.lookback_window, \
@@ -61,6 +74,7 @@ class CustomTradingEnv(gym.Env):
             self.action_space = spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
 
         # Define observation space: Price bars, portfolio balance, and holdings
+        momentum_columns = ['momentum', 'roc']
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -79,16 +93,31 @@ class CustomTradingEnv(gym.Env):
         # Randomize the initial step and balance
         max_start = len(self.df) - self.lookback_window - 1
         self.current_step = random.randint(self.lookback_window, max_start)
-        self.balance = self.initial_balance * random.uniform(0.8, 1.2)
+        # self.balance = self.initial_balance * random.uniform(0.8, 1.2)
+        self.balance = self.initial_balance
 
+        self.cost_basis = 0  # Initialize cost basis
+
+        self.trade_volume = 0
+        self.trade_count = 0
+
+        self.episode_return = 0  # Reset cumulative return for the episode
+
+        self.total_realized_profit = 0  
         # Deterministic initial step and balance
         # self.current_step = self.lookback_window
         # self.balance = self.initial_balance
 
         self.holdings = 0
         self.total_value = self.initial_balance
+        self.returns = []  # Track returns for Sharpe Ratio calculation
         self.trades = []
         self.current_episode_steps = 0  # Reset episode step counter
+
+        # Reset cost basis tracking
+        self.cost_basis_per_share = 0
+        self.total_shares_bought = 0
+        self.total_cost = 0
 
         # Return the initial observation and an empty info dictionary
         return self._get_observation(), {}
@@ -123,19 +152,43 @@ class CustomTradingEnv(gym.Env):
             done = True
             return self._get_observation(), reward, done, False, {}
 
+        #initial values for balance and holdings
+        last_balance = self.balance
+        last_holdings = self.holdings
+
+
+        realized_profit = 0
+
         # Execute action
         if trading_action > 0:  # Buy
             allocation = min(trading_action, 1)  # Cap allocation to 1 (100%)
             amount_to_buy = allocation * self.balance
-            self.holdings += amount_to_buy / current_price
+            shares_bought = amount_to_buy / current_price
+            
+            # Update cost basis using weighted average
+            self.total_shares_bought += shares_bought
+            self.total_cost += amount_to_buy
+            self.cost_basis_per_share = self.total_cost / self.total_shares_bought if self.total_shares_bought > 0 else 0
+            
+            self.holdings += shares_bought
             self.balance -= amount_to_buy
             self.trades.append((self.current_step, 'buy', current_price, allocation))
         elif trading_action < 0:  # Sell
             allocation = min(abs(trading_action), 1)  # Cap allocation to 1 (100%)
-            amount_to_sell = allocation * self.holdings * current_price
+            shares_sold = allocation * self.holdings
+            amount_to_sell = shares_sold * current_price
+            
+            # Calculate realized profit directly
+            realized_profit = shares_sold * (current_price - self.cost_basis_per_share)
+            
+            # Update holdings and balance
+            self.holdings -= shares_sold
             self.balance += amount_to_sell * (1 - self.transaction_cost)
-            self.holdings -= allocation * self.holdings
+            
+            # No need to adjust cost_basis_per_share when selling
+            self.total_realized_profit += realized_profit
             self.trades.append((self.current_step, 'sell', current_price, allocation))
+
 
         # Update portfolio value
         previous_total_value = self.total_value
@@ -145,6 +198,41 @@ class CustomTradingEnv(gym.Env):
 
         # Calculate step-to-step profit/loss
         step_return = (self.total_value - previous_total_value) / self.initial_balance
+
+        self.episode_return += step_return  # Update cumulative return for the episode
+
+        # Calculate unrealized profit/loss
+        unrealized_pnl = self.holdings * (current_price - self.cost_basis_per_share)
+        unrealized_pnl = np.clip(unrealized_pnl, -self.initial_balance, self.initial_balance)  # Cap to [-initial_balance, initial_balance]
+
+        # Reward for holding a profitable position
+        if unrealized_pnl > 0:
+            pnl_reward = 0.1 * (unrealized_pnl / self.initial_balance)  # Scale reward
+        else:
+            pnl_reward = -0.1 * (abs(unrealized_pnl) / self.initial_balance)  # Penalize unrealized losses
+
+        
+        # Check if holdings are below the threshold
+        if self.holdings * current_price < self.low_holdings_threshold * self.initial_balance:
+            self.low_holdings_counter += 1  # Increment the counter
+        else:
+            self.low_holdings_counter = 0  # Reset the counter if holdings exceed the threshold
+
+        inactivity_penalty = -0.01 * self.low_holdings_counter  # Increase penalty with consecutive low holdings
+
+
+        # Track transaction volume
+        if not hasattr(self, 'transaction_volume'):
+            self.transaction_volume = 0
+            self.trade_count = 0
+
+        # Update transaction volume and trade count
+        if self.holdings != last_holdings or self.balance != last_balance:
+            # Correct transaction volume calculation
+            trade_volume = abs(self.holdings - last_holdings) * current_price  # Use holdings difference
+            self.transaction_volume += trade_volume
+            self.trade_count += 1
+
 
         # Track returns for Sharpe Ratio calculation
         if not hasattr(self, 'returns'):
@@ -164,7 +252,7 @@ class CustomTradingEnv(gym.Env):
         max_portfolio_value = max(self.total_value, getattr(self, 'max_portfolio_value', self.total_value))
         self.max_portfolio_value = max_portfolio_value
         drawdown = (max_portfolio_value - self.total_value) / max_portfolio_value if max_portfolio_value > 0 else 0
-        drawdown_penalty = 0
+        drawdown_penalty = -drawdown
 
         # Include sentiment score
         sentiment_score = 0
@@ -174,19 +262,58 @@ class CustomTradingEnv(gym.Env):
         else:
             sentiment_score = 0
 
+        
+        # Normalize reward components
+        step_return = np.clip(step_return, -1, 1)
+        pnl_reward = np.clip(pnl_reward, -1, 1)
+        drawdown_penalty = np.clip(drawdown_penalty, -1, 1)
+
+        term_penalty = 0
+
+        # Penalize large trades
+        trade_penalty = -0.001 * abs(action)
+        trade_penalty = 0
+
+        # Calculate momentum-based reward
+        momentum = self.df.loc[self.current_step, 'momentum']
+        momentum_reward = 0
+        if momentum > 0 and trading_action > 0:  # Reward buying in positive momentum
+            momentum_reward = 0.1
+        elif momentum < 0 and trading_action < 0:  # Reward selling in negative momentum
+            momentum_reward = 0.1
+        elif momentum > 0 and trading_action < 0:  # Penalize selling in positive momentum
+            momentum_reward = -0.1
+        elif momentum < 0 and trading_action > 0:  # Penalize buying in negative momentum
+            momentum_reward = -0.1
+
+        realized_profit_reward = np.clip(realized_profit / self.initial_balance, -1, 1)  # Scale reward based on initial balance
+
+        # Add momentum reward to the total reward
+        reward = (
+            0.9 * realized_profit_reward +
+            0.1 * pnl_reward +
+            # 0.3 * sharpe_ratio +
+            # 0.1 * sentiment_score
+            # 0.2 * drawdown_penalty +
+            trade_penalty + inactivity_penalty + term_penalty + momentum_reward
+        )
+        
         if self.term_train:
             # Check if the agent chooses to terminate the episode
             if terminate_action > 0.5:  # Threshold for termination
-                reward = -0.1  # Small penalty for terminating early
+                term_penalty = -0.1  # Small penalty for terminating early
                 if drawdown > 0.2:
-                    reward += 0.3  # Reward for terminating early
+                    term_penalty = 0.2  # Reward for terminating early
                 done = True
                 truncated = True
                 return self._get_observation(), reward, done, truncated, {}
 
-        # Penalize large trades
-        # trade_penalty = -0.001 * abs(action)
-        trade_penalty = 0
+
+        if self.term_train:
+            # Add a penalty for high drawdowns or volatility
+            if drawdown > 0.5:  # threshold for extremely high drawdown
+                term_penalty -= 0.5  # Penalize for staying in the market
+
 
         # Adjust weights dynamically based on training phase
         # if self.total_steps < self.transition_steps:
@@ -197,20 +324,7 @@ class CustomTradingEnv(gym.Env):
         #         0.5 * sharpe_ratio +
         #         0.1 * drawdown_penalty
         #     )
-
-        reward = (
-            0.6 * step_return +
-            0.3 * sharpe_ratio +
-            0.1 * sentiment_score
-            # 0.2 * drawdown_penalty 
-        )
-
-        if self.term_train:
-            # Add a penalty for high drawdowns or volatility
-            if drawdown > 0.2:  # Example threshold for high drawdown
-                reward -= 0.5  # Penalize for staying in the market
-
-
+    
 
         # Advance to the next step
         self.current_step += 1
@@ -227,10 +341,23 @@ class CustomTradingEnv(gym.Env):
         # Add metrics to the info dictionary
         info = {
             "sharpe_ratio": sharpe_ratio,
-            "step_return": step_return,
+            "episode_return": self.episode_return,
             "drawdown_penalty": drawdown_penalty,
             "trade_penalty": trade_penalty,
+            "inactivity_penalty": inactivity_penalty,
+            "transaction_volume": self.transaction_volume,
+            "trade_count": self.trade_count,
+            "unrealized_pnl": unrealized_pnl,
+            "pnl_reward": pnl_reward,
+            "momentum": momentum,
+            "momentum_reward": momentum_reward,
+            "total_realized_profit": self.total_realized_profit
         }
+
+        # Ensure no NaN or inf values in rewards
+        assert not np.isnan(reward), "Reward is NaN."
+        assert not np.isinf(reward), "Reward is inf."
+
 
         # print(f"Step: {self.current_step}, Action: {action}, Total Value: {self.total_value}") #  Balance: {self.balance}, Holdings: {self.holdings},
         # Return step information
@@ -251,14 +378,47 @@ class CustomTradingEnv(gym.Env):
         volume_column = 'volume'
         technical_columns = ['ma_10', 'rsi']  # Add technical indicators here
 
+        # Normalize momentum and ROC using z-score normalization
+        momentum_columns = ['momentum', 'roc']
+        for col in momentum_columns:
+            if frame[col].std() == 0:  # Handle constant momentum
+                frame[col] = 0
+            else:
+                frame[col] = (frame[col] - frame[col].mean()) / (frame[col].std() + 1e-8)
+
         # Normalize prices using min-max scaling
-        frame[price_columns] = (frame[price_columns] - frame[price_columns].min()) / (frame[price_columns].max() - frame[price_columns].min() + 1e-8)
+        price_columns = ['open', 'high', 'low', 'close']
+        for col in price_columns:
+            col_min = frame[col].min()
+            col_max = frame[col].max()
+            if col_max - col_min == 0:  # Handle constant values
+                frame[col] = 0  # Set to 0 if no variation
+            else:
+                frame[col] = (frame[col] - col_min) / (col_max - col_min + 1e-8)
 
         # Normalize volume using z-score normalization
-        frame[volume_column] = (frame[volume_column] - frame[volume_column].mean()) / (frame[volume_column].std() + 1e-8)
+        volume_column = 'volume'
+        if frame[volume_column].std() == 0:  # Handle constant volume
+            frame[volume_column] = 0
+        else:
+            frame[volume_column] = (frame[volume_column] - frame[volume_column].mean()) / (frame[volume_column].std() + 1e-8)
 
         # Normalize technical indicators using z-score normalization
-        frame[technical_columns] = (frame[technical_columns] - frame[technical_columns].mean()) / (frame[technical_columns].std() + 1e-8)
+        technical_columns = ['ma_10', 'rsi']
+        for col in technical_columns:
+            if frame[col].std() == 0:  # Handle constant technical indicators
+                frame[col] = 0
+            else:
+                frame[col] = (frame[col] - frame[col].mean()) / (frame[col].std() + 1e-8)
+
+        # # Normalize prices using min-max scaling
+        # frame[price_columns] = (frame[price_columns] - frame[price_columns].min()) / (frame[price_columns].max() - frame[price_columns].min() + 1e-8)
+
+        # # Normalize volume using z-score normalization
+        # frame[volume_column] = (frame[volume_column] - frame[volume_column].mean()) / (frame[volume_column].std() + 1e-8)
+
+        # # Normalize technical indicators using z-score normalization
+        # frame[technical_columns] = (frame[technical_columns] - frame[technical_columns].mean()) / (frame[technical_columns].std() + 1e-8)
 
         # Add portfolio balance and holdings as features (broadcast scalar values to match the frame length)
         frame['balance'] = (self.balance / self.initial_balance) * np.ones(len(frame))  # Normalize balance

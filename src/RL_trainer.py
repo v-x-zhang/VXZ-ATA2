@@ -22,12 +22,22 @@ class TensorboardCallback(BaseCallback):
             last_info = infos[-1]  # Get the most recent info dictionary
             if "sharpe_ratio" in last_info:
                 self.logger.record("custom/sharpe_ratio", last_info["sharpe_ratio"])
-            if "step_return" in last_info:
-                self.logger.record("custom/step_return", last_info["step_return"])
+            if "episode_return" in last_info:
+                self.logger.record("custom/episode_return", last_info["episode_return"])
             if "drawdown_penalty" in last_info:
                 self.logger.record("custom/drawdown_penalty", last_info["drawdown_penalty"])
             if "trade_penalty" in last_info:
                 self.logger.record("custom/trade_penalty", last_info["trade_penalty"])
+            if "unrealized_pnl" in last_info:
+                self.logger.record("custom/unrealized_pnl", last_info["unrealized_pnl"])
+            if "total_realized_profit" in last_info:
+                self.logger.record("custom/total_realized_profit", last_info["total_realized_profit"])
+            if "transaction_volume" in last_info:
+                self.logger.record("custom/transaction_volume", last_info["transaction_volume"])
+            if "trade_count" in last_info:
+                self.logger.record("custom/trade_count", last_info["trade_count"])
+            if "momentum" in last_info:
+                self.logger.record("custom/momentum", last_info["momentum"])
 
         # Example: Log the total reward
         total_reward = self.locals.get("rewards", 0)
@@ -69,7 +79,7 @@ def compute_rsi(close_prices, window=14):
 
 # Load historical data
 symbol = "AAPL"
-df = pd.read_csv(f"data/{symbol}_with_sentiment.csv")
+df = pd.read_csv(f"data/{symbol}.csv")
 
 # Preprocess the data
 df['timestamp'] = pd.to_datetime(df['timestamp'])  # Convert timestamp to datetime
@@ -81,6 +91,9 @@ df = df.astype(float)  # Ensure all remaining columns are numeric
 # Add technical indicators
 df['ma_10'] = df['close'].rolling(window=10).mean()
 df['rsi'] = compute_rsi(df['close'])  # Implement compute_rsi function
+df['momentum'] = df['close'] - df['close'].shift(10)  # Momentum: Difference between current and 10 steps ago
+df['roc'] = (df['close'] / df['close'].shift(10) - 1) * 100  # Rate of Change (ROC)
+
 
 # Handle NaN values
 df.loc[:, 'rsi'] = df['rsi'].fillna(50)  # Fill NaN RSI values with 50
