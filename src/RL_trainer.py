@@ -1,12 +1,15 @@
+import pandas as pd
+import numpy as np
+import optuna
+import torch
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import SubprocVecEnv
-from stable_baselines3.common.vec_env import VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecNormalize
+from stable_baselines3.common.env_checker import check_env
 from custom_trading_env import CustomTradingEnv
-import pandas as pd
 from stable_baselines3.common.callbacks import BaseCallback
-import os
-import numpy as np
+import json
+from tqdm import tqdm
 
 class TensorboardCallback(BaseCallback):
     """
@@ -223,88 +226,272 @@ def compute_adx(df, window=14):
     
     return adx
 
-# Load historical data
-symbol = "AAPL"
-df = pd.read_csv(f"data/{symbol}.csv")
+# --- Global Variables for Objective Function ---
+train_df = None
+eval_df = None
+initial_balance = 100000
+lookback_window = 30
+hpo_train_timesteps = 100_000
+final_train_timesteps = 1_000_000
 
-# Preprocess the data
-df['timestamp'] = pd.to_datetime(df['timestamp'])  # Convert timestamp to datetime
-# df = df.set_index('timestamp').resample('min').ffill().reset_index()  # Fill missing timestamps
-# df = df.sort_values(by='timestamp')  # Sort data by timestamp
-# Add time features to help the agent learn intraday patterns
-hour = df['timestamp'].dt.hour
-minute = df['timestamp'].dt.minute
-time_of_day = (hour * 60 + minute) / (24 * 60)  # Normalized time of day
-df = df[['open', 'high', 'low', 'close', 'volume']]  # Ensure correct column order
-df = df.astype(float)  # Ensure all remaining columns are numeric
-df['time_of_day'] = time_of_day
+# --- Callback for HPO Training Progress ---
+class HpoTrainProgressCallback(BaseCallback):
+    """
+    Updates a TQDM progress bar during HPO training steps.
+    """
+    def __init__(self, pbar, verbose=0):
+        super(HpoTrainProgressCallback, self).__init__(verbose)
+        self.pbar = pbar
+        self.last_logged_timestep = 0
 
-# Add technical indicators
-df['ma_10'] = df['close'].rolling(window=10).mean()
-df['rsi'] = compute_rsi(df['close'])  # Implement compute_rsi function
-df['momentum'] = df['close'] - df['close'].shift(10)  # Momentum: Difference between current and 10 steps ago
-df['roc'] = (df['close'] / df['close'].shift(10) - 1) * 100  # Rate of Change (ROC)
+    def _on_step(self) -> bool:
+        steps_taken = self.num_timesteps - self.last_logged_timestep
+        self.pbar.update(steps_taken)
+        self.last_logged_timestep = self.num_timesteps
+        return True
 
-# Add volatility indicators
-df['atr'] = compute_average_true_range(df, window=14)
-df['bbands_width'] = compute_bollinger_band_width(df, window=20)
+def objective(trial):
+    global train_df, eval_df, initial_balance, lookback_window, hpo_train_timesteps
 
-# Add trend indicators
-df['macd'] = compute_macd(df['close'])
-df['adx'] = compute_adx(df, window=14)  # Average Directional Index for trend strength
+    learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
+    gamma = trial.suggest_float("gamma", 0.95, 0.999)
+    tau = trial.suggest_float("tau", 0.001, 0.02)
+    batch_size = trial.suggest_categorical("batch_size", [256, 512, 1024])
+    ent_coef_val = trial.suggest_float("ent_coef_val", 0.01, 0.2)
+    ent_coef = f'auto_{ent_coef_val:.3f}'
+    n_layers = trial.suggest_int("n_layers", 1, 3)
+    layer_size = trial.suggest_categorical("layer_size", [128, 256, 512])
+    net_arch = [layer_size] * n_layers
 
+    vec_train_env = None # Initialize to None
+    vec_eval_env = None  # Initialize to None
+    hpo_train_pbar = None # Initialize pbar to None
 
+    try:
+        vec_train_env = DummyVecEnv([lambda: CustomTradingEnv(df=train_df,
+                                                              initial_balance=initial_balance,
+                                                              lookback_window=lookback_window,
+                                                              max_episode_length=len(train_df)-lookback_window-1,
+                                                              DEBUG=False)])
+        vec_train_env = VecNormalize(vec_train_env, norm_obs=True, norm_reward=False, gamma=gamma)
 
-# Handle NaN values
-df.loc[:, 'rsi'] = df['rsi'].fillna(50)  # Fill NaN RSI values with 50
-df.dropna(inplace=True)  # Drop rows with any remaining NaN values
+        vec_eval_env = DummyVecEnv([lambda: CustomTradingEnv(df=eval_df,
+                                                             initial_balance=initial_balance,
+                                                             lookback_window=lookback_window,
+                                                             max_episode_length=len(eval_df)-lookback_window-1,
+                                                             DEBUG=False)])
+        vec_eval_env = VecNormalize(vec_eval_env, training=False, norm_obs=True, norm_reward=False)
+        vec_eval_env.obs_rms = vec_train_env.obs_rms
+        vec_eval_env.ret_rms = vec_train_env.ret_rms
 
-# Initialize the environment
-env = CustomTradingEnv(df=df)
+        model = SAC(
+            "MlpPolicy",
+            vec_train_env,
+            verbose=0,
+            learning_rate=learning_rate,
+            gamma=gamma,
+            tau=tau,
+            batch_size=batch_size,
+            ent_coef=ent_coef,
+            policy_kwargs={"net_arch": net_arch},
+            learning_starts=10000,
+            gradient_steps=trial.suggest_int("gradient_steps", 1, 4),
+            device="cuda",
+        )
 
-# # Wrap the environment for vectorized training
-vec_env = make_vec_env(lambda: env, n_envs=1)
+        # Create and manage the progress bar for this trial's training
+        hpo_train_pbar = tqdm(total=hpo_train_timesteps, desc=f"Trial {trial.number} Training", leave=False, position=1)
+        hpo_train_callback = HpoTrainProgressCallback(hpo_train_pbar)
 
-# Normalize observations and rewards
-vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True)
+        model.learn(total_timesteps=hpo_train_timesteps, callback=hpo_train_callback)
+        hpo_train_pbar.close()
 
-# Define a directory for TensorBoard logs
-tensorboard_log_dir = "tensorboard_logs/"
+        obs = vec_eval_env.reset()
+        portfolio_values = [initial_balance]
+        done = False
+        steps = 0
+        max_eval_steps = len(eval_df) - lookback_window - 1
 
-# Initialize the PPO model with TensorBoard logging enabled
-# model = PPO(
-#     "MlpPolicy",
-#     vec_env,
-#     verbose=1,
-#     learning_rate=1e-4,  # Decreased learning rate
-#     ent_coef=0.4,  # Encourage exploration
-#     gamma=0.99,  # Discount factor
-#     n_steps=4096 // env_count,  # Smaller batch of steps
-#     batch_size=128,  # Batch size for updates
-#     clip_range=0.2,  # Increased clipping range
-#     tensorboard_log=tensorboard_log_dir  # Enable TensorBoard logging
-# )
+        while not done and steps < max_eval_steps:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done, info = vec_eval_env.step(action)
+            actual_info = info[0] if isinstance(info, list) else info
+            portfolio_values.append(actual_info.get("total_value", portfolio_values[-1]))
+            steps += 1
+            if done:
+                 break
 
-# SAC Model
-model = SAC(
-    "MlpPolicy",
-    vec_env,
-    verbose=1,
-    learning_rate=3e-4,        # Slightly higher learning rate
-    ent_coef='auto_0.1',       # Start with higher entropy coefficient
-    gamma=0.99,
-    buffer_size=200000,        # Larger buffer for better experience replay
-    learning_starts=2000,      # More initial exploration
-    batch_size=256,            # Larger batch size
-    tau=0.01,                  # Slower target update
-    tensorboard_log=tensorboard_log_dir,
-    device='cuda',
-)
+        final_portfolio_value = portfolio_values[-1]
+        total_return = (final_portfolio_value - initial_balance) / initial_balance
 
-# Train the model
-model.learn(total_timesteps=1_000_000, callback=TensorboardCallback())
+        vec_train_env.close()
+        vec_eval_env.close()
+        del model, vec_train_env, vec_eval_env
 
-# Save the trained model
-# model.save(f"models/ppo_model_{symbol}")
+        return total_return
 
-model.save(f"models/SAC_model_{symbol}")
+    except Exception as e:
+        print(f"!!! Trial {trial.number} failed with exception: {e}")
+        import traceback
+        print(traceback.format_exc())
+        if vec_train_env:
+            try: vec_train_env.close()
+            except: pass
+        if vec_eval_env:
+            try: vec_eval_env.close()
+            except: pass
+        if hpo_train_pbar:
+            try: hpo_train_pbar.close()
+            except: pass
+        return -np.inf
+    finally:
+        if vec_train_env:
+            try: vec_train_env.close()
+            except: pass
+        if vec_eval_env:
+            try: vec_eval_env.close()
+            except: pass
+        if hpo_train_pbar and not hpo_train_pbar.disable:
+             try: hpo_train_pbar.close()
+             except: pass
+
+if __name__ == "__main__":
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    print(f"CUDA device count: {torch.cuda.device_count()}")
+    if torch.cuda.is_available():
+        print(f"CUDA device name: {torch.cuda.get_device_name(0)}")
+
+    symbol = "AAPL"
+    df = pd.read_csv(f"data/{symbol}.csv")
+    n_hpo_trials = 50
+    n_envs_final = 4
+
+    print("Loading and preprocessing data...")
+    df_raw = pd.read_csv(f"data/{symbol}.csv")
+    df_raw['timestamp'] = pd.to_datetime(df_raw['timestamp'])
+
+    hour = df_raw['timestamp'].dt.hour
+    minute = df_raw['timestamp'].dt.minute
+    df_raw['time_of_day'] = (hour * 60 + minute) / (24 * 60)
+    df_features = df_raw[[ 'open', 'high', 'low', 'close', 'volume', 'time_of_day']].copy()
+    df_features = df_features.astype({'open': float, 'high': float, 'low': float, 'close': float, 'volume': float, 'time_of_day': float})
+
+    df_features['ma_10'] = df_features['close'].rolling(window=10).mean()
+    df_features['rsi'] = compute_rsi(df_features['close'])
+    df_features['momentum'] = df_features['close'] - df_features['close'].shift(10)
+    df_features['roc'] = (df_features['close'] / df_features['close'].shift(10) - 1) * 100
+    df_features['atr'] = compute_average_true_range(df_features, window=14)
+    df_features['bbands_width'] = compute_bollinger_band_width(df_features, window=20)
+    df_features['macd'] = compute_macd(df_features['close'])
+    df_features['adx'] = compute_adx(df_features, window=14)
+
+    df_features.loc[:, 'rsi'] = df_features['rsi'].fillna(50)
+    df_clean = df_features.dropna().reset_index(drop=True)
+    print(f"Data shape after cleaning NaNs: {df_clean.shape}")
+
+    total_len = len(df_clean)
+    train_size = int(total_len * 0.75)
+    eval_size = int(total_len * 0.125)
+    test_size = total_len - train_size - eval_size
+
+    train_df = df_clean[:train_size]
+    eval_df = df_clean[train_size:train_size + eval_size]
+    test_df = df_clean[train_size + eval_size:]
+
+    print(f"Data split: Train={len(train_df)}, Eval={len(eval_df)}, Test={len(test_df)}")
+
+    print("\n--- Starting Hyperparameter Optimization ---")
+    study = optuna.create_study(direction="maximize", study_name=f"SAC_{symbol}_HPO")
+
+    hpo_pbar = tqdm(total=n_hpo_trials, desc="HPO Trials", position=0)
+
+    def hpo_callback(study, trial):
+        hpo_pbar.update(1)
+        hpo_pbar.set_description(f"HPO Trials (Best Return: {study.best_value:.4f})")
+
+    try:
+        study.optimize(objective, n_trials=n_hpo_trials, n_jobs=1, callbacks=[hpo_callback])
+    finally:
+        hpo_pbar.close()
+
+    print("\n--- Hyperparameter Optimization Finished ---")
+    print("Number of finished trials: ", len(study.trials))
+    print("Best trial:")
+    best_trial = study.best_trial
+    print("  Value (Total Return): ", best_trial.value)
+    print("  Params: ")
+    for key, value in best_trial.params.items():
+        print(f"    {key}: {value}")
+
+    best_params = best_trial.params
+    best_params['policy_kwargs'] = {"net_arch": [best_params.pop('layer_size')] * best_params.pop('n_layers')}
+    best_params['ent_coef'] = f'auto_{best_params.pop("ent_coef_val"):.3f}'
+    best_params.pop('net_arch_idx', None)
+
+    best_params_filepath = f"models/best_params_SAC_{symbol}.json"
+    with open(best_params_filepath, 'w') as f:
+        json.dump(best_params, f, indent=4)
+    print(f"Best hyperparameters saved to {best_params_filepath}")
+
+    print("\n--- Starting Final Model Training with Best Hyperparameters ---")
+    final_train_df = pd.concat([train_df, eval_df]).reset_index(drop=True)
+    print(f"Using combined data for final training: {len(final_train_df)} rows")
+
+    def make_final_env():
+         return CustomTradingEnv(df=final_train_df,
+                                 initial_balance=initial_balance,
+                                 lookback_window=lookback_window,
+                                 max_episode_length=4000,
+                                 DEBUG=False)
+
+    if n_envs_final > 1:
+        vec_final_train_env = SubprocVecEnv([make_final_env for _ in range(n_envs_final)])
+    else:
+        vec_final_train_env = DummyVecEnv([make_final_env])
+
+    vec_final_train_env = VecNormalize(vec_final_train_env,
+                                       norm_obs=True,
+                                       norm_reward=False,
+                                       gamma=best_params['gamma'])
+
+    final_model = SAC(
+        "MlpPolicy",
+        vec_final_train_env,
+        verbose=1,
+        device="cuda",
+        tensorboard_log="tensorboard_logs/",
+        **best_params
+    )
+
+    print(f"Training final model for {final_train_timesteps} timesteps...")
+    with tqdm(total=final_train_timesteps, desc="Final Training", position=0) as training_pbar:
+        class TqdmUpdateCallback(BaseCallback):
+            def __init__(self, pbar):
+                super().__init__(verbose=0)
+                self.pbar = pbar
+                self.last_logged_timestep = 0
+
+            def _on_step(self) -> bool:
+                steps_taken = self.num_timesteps - self.last_logged_timestep
+                self.pbar.update(steps_taken)
+                self.last_logged_timestep = self.num_timesteps
+                return True
+
+        combined_callbacks = [TensorboardCallback(), TqdmUpdateCallback(training_pbar)]
+
+        final_model.learn(total_timesteps=final_train_timesteps,
+                          callback=combined_callbacks,
+                          tb_log_name=f"SAC_{symbol}_final_run",
+                          log_interval=100)
+
+    model_save_path = f"models/SAC_model_{symbol}_final.zip"
+    stats_save_path = f"models/SAC_vecnormalize_{symbol}_final.pkl"
+    final_model.save(model_save_path)
+    vec_final_train_env.save(stats_save_path)
+    print(f"Final model saved to {model_save_path}")
+    print(f"Normalization stats saved to {stats_save_path}")
+
+    vec_final_train_env.close()
+
+    print("\n--- Training Complete ---")
